@@ -1,0 +1,7 @@
+{
+  "name": "Monster Master: Evolution TCG RPG",
+  "description": "Jogo de batalha de cartas estratégico no estilo Monster Master e Yu-Gi-Oh com evolução de monstros estilo Pokémon, modo história RPG com NPCs e lojas, duelo local pass-and-play e multiplayer online ranqueado.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
