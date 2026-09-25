@@ -47,7 +47,12 @@ export interface CardDefinition {
     | 'curse' 
     | 'black_hole' 
     | 'restore'
-    | 'evolution_stone';
+    | 'evolution_stone'
+    | 'tsunami'
+    | 'earthquake'
+    | 'berserk'
+    | 'thorns'
+    | 'arcane_barrier';
   spellPower?: number;
 }
 

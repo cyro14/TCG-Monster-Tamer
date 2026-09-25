@@ -3,14 +3,15 @@
  * Faithful adaptation of the classic Monster Master arena with Pokémon Evolution mechanics
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   BattleState,
   BoardMonster,
   CardDefinition,
 } from '../../types/game';
 import { CARDS_BY_ID } from '../../data/cards';
-import { CardComponent } from './CardComponent';
+import { CardComponent, getElementColors } from './CardComponent';
+import { CardArt } from './CardArt';
 import { sound } from '../../utils/audio';
 import confetti from 'canvas-confetti';
 import {
@@ -51,6 +52,76 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   const [animatingEvolution, setAnimatingEvolution] = useState<string | null>(null);
   const [floatingNotification, setFloatingNotification] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(sound.getMuted());
+  const [inspectedCard, setInspectedCard] = useState<CardDefinition | null>(null);
+  const [hoveredCard, setHoveredCard] = useState<CardDefinition | null>(null);
+
+  // Floating combat text (damage, heals, destruction notices)
+  const [floatingTexts, setFloatingTexts] = useState<
+    Array<{ id: string; targetKey: string; text: string; color: string }>
+  >([]);
+
+  // Combat animations: lunging attacking slot and shaking/struck target
+  const [attackingSlotKey, setAttackingSlotKey] = useState<string | null>(null);
+  const [hitTargetKey, setHitTargetKey] = useState<string | null>(null);
+
+  // Long press timer for mobile cards (only zoom when holding pressed)
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isLongPressActiveRef = useRef<boolean>(false);
+
+  const startLongPress = (card: CardDefinition) => {
+    isLongPressActiveRef.current = false;
+    longPressTimerRef.current = setTimeout(() => {
+      isLongPressActiveRef.current = true;
+      sound.playButtonClick();
+      setInspectedCard(card);
+    }, 400); // 400ms hold to zoom on mobile
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  const showFloatingText = (targetKey: string, text: string, color: string) => {
+    const id = `ftext_${Date.now()}_${Math.random()}`;
+    setFloatingTexts((prev) => [...prev, { id, targetKey, text, color }]);
+    setTimeout(() => {
+      setFloatingTexts((prev) => prev.filter((item) => item.id !== id));
+    }, 1300);
+  };
+
+  const triggerCombatDamage = (
+    sourceKey: string,
+    targetKey: string,
+    damageAmount: number,
+    isDestroyed = false,
+    isDirect = false
+  ) => {
+    setAttackingSlotKey(sourceKey);
+    setTimeout(() => {
+      setAttackingSlotKey(null);
+      setHitTargetKey(targetKey);
+      const text = isDirect ? `💥 -${damageAmount} HP` : `-${damageAmount} 🛡️`;
+      const color = isDirect ? 'text-amber-400 font-black' : 'text-rose-400 font-bold';
+      showFloatingText(targetKey, text, color);
+
+      if (isDestroyed) {
+        setTimeout(() => {
+          showFloatingText(targetKey, '💀 DESTRUÍDO!', 'text-red-500 font-black');
+        }, 220);
+      }
+    }, 180);
+
+    setTimeout(() => {
+      setHitTargetKey((prev) => (prev === targetKey ? null : prev));
+    }, 550);
+  };
+
+  const triggerHeal = (targetKey: string, amount: number) => {
+    showFloatingText(targetKey, `+${amount} HP ✨`, 'text-emerald-400 font-bold');
+  };
 
   // Show floating text banner
   const triggerNotification = (text: string) => {
@@ -94,18 +165,28 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
     }
   }, [battle.player1.hp, battle.player2.hp, battle.winner, battle.player1.name, battle.player2.name, onBattleWon, onBattleLost]);
 
-  // Current active player object
-  const activePlayerKey = battle.currentTurn;
-  const isPlayer1Turn = battle.currentTurn === 'player1';
-  const activePlayer = isPlayer1Turn ? battle.player1 : battle.player2;
-  const defendingPlayer = isPlayer1Turn ? battle.player2 : battle.player1;
+  // Current active player and perspective definition
+  const isPassAndPlay = battle.mode === 'pass_and_play';
+  // In Pass & Play (same device duel), bottom player is whoever's turn it is so the friend holding the phone sees their hand!
+  // In Story / Ranked, bottom player is always player1 (the human player).
+  const bottomPlayerKey: 'player1' | 'player2' = isPassAndPlay ? battle.currentTurn : 'player1';
+  const topPlayerKey: 'player1' | 'player2' = bottomPlayerKey === 'player1' ? 'player2' : 'player1';
 
-  // Handle clicking a card in player hand
+  const bottomPlayer = battle[bottomPlayerKey];
+  const topPlayer = battle[topPlayerKey];
+  const activePlayer = battle[battle.currentTurn];
+  const defendingPlayer = battle[battle.currentTurn === 'player1' ? 'player2' : 'player1'];
+
+  // Handle clicking a card in bottom player's hand
   const handleHandCardClick = (cardIndex: number) => {
     if (battle.winner) return;
+    if (battle.currentTurn !== bottomPlayerKey) {
+      triggerNotification('Espere a sua vez de jogar!');
+      return;
+    }
     sound.playButtonClick();
 
-    const card = activePlayer.hand[cardIndex];
+    const card = bottomPlayer.hand[cardIndex];
     if (!card) return;
 
     // Check if player clicked already selected card to deselect
@@ -132,6 +213,12 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       if (card.spellEffect === 'black_hole') {
         // Global spell: triggers immediately
         applyBlackHole(cardIndex);
+      } else if (card.spellEffect === 'tsunami') {
+        // Global enemy AoE spell
+        applyTsunami(cardIndex);
+      } else if (card.spellEffect === 'arcane_barrier') {
+        // Global ally shield spell
+        applyArcaneBarrier(cardIndex);
       } else if (card.spellEffect === 'restore') {
         // Direct player heal
         applyPlayerRestore(cardIndex, card.spellPower || 2);
@@ -139,7 +226,8 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         card.spellEffect === 'fireball' ||
         card.spellEffect === 'lightning' ||
         card.spellEffect === 'poison' ||
-        card.spellEffect === 'curse'
+        card.spellEffect === 'curse' ||
+        card.spellEffect === 'earthquake'
       ) {
         // Target enemy monster
         setTargetMode({ type: 'spell_enemy', spellCard: card });
@@ -155,11 +243,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   // Summon basic monster onto field slot
   const handleSummonMonster = (slotIndex: number) => {
     if (battle.selectedCardIndex === null) return;
-    const card = activePlayer.hand[battle.selectedCardIndex];
+    const card = bottomPlayer.hand[battle.selectedCardIndex];
     if (!card || card.type !== 'monster' || card.stage > 1) return;
 
     // Check if slot is occupied
-    if (activePlayer.field[slotIndex]) {
+    if (bottomPlayer.field[slotIndex]) {
       triggerNotification('Esse espaço já está ocupado por outro monstro!');
       return;
     }
@@ -170,22 +258,20 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       instanceId: `${card.id}_${Date.now()}_${Math.random()}`,
       card,
       currentAttack: card.attack,
-      currentDefense: card.defense,
-      maxDefense: card.maxDefense,
+      currentDefense: card.defense || card.maxDefense || 2,
+      maxDefense: card.maxDefense || card.defense || 2,
       summonTurnsLeft: card.summonTurns,
       isReady: card.summonTurns === 0,
-      hasAttacked: false,
+      hasAttacked: true, // Cannot attack in the same turn it enters (summoning sickness)
       statusEffects: {},
     };
 
-    const newField = [...activePlayer.field];
-    newField[slotIndex] = newMonster;
-
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
-
     setBattle((prev) => {
-      const pKey = prev.currentTurn;
-      const otherKey = pKey === 'player1' ? 'player2' : 'player1';
+      const pKey = bottomPlayerKey;
+      const newHand = prev[pKey].hand.filter((_, idx) => idx !== prev.selectedCardIndex);
+      const newField = [...prev[pKey].field];
+      newField[slotIndex] = newMonster;
+
       return {
         ...prev,
         [pKey]: {
@@ -195,7 +281,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         },
         selectedCardIndex: null,
         combatLog: [
-          `${prev[pKey].name} invocou ${card.name} (${card.summonTurns}t de espera)!`,
+          `⚔️ ${prev[pKey].name} invocou ${card.name} (${card.summonTurns}t de espera)!`,
           ...prev.combatLog,
         ],
       };
@@ -206,7 +292,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
 
   // Apply Pokémon Evolution to a friendly monster
   const handleEvolveMonster = (slotIndex: number, evoCard: CardDefinition) => {
-    const targetMonster = activePlayer.field[slotIndex];
+    const targetMonster = bottomPlayer.field[slotIndex];
     if (!targetMonster) return;
 
     // Check compatibility: either normal evolution chain or Evolution Stone
@@ -247,59 +333,120 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       hasAttacked: false,
     };
 
-    const newField = [...activePlayer.field];
-    newField[slotIndex] = evolvedMonster;
+    setBattle((prev) => {
+      const pKey = bottomPlayerKey;
+      const otherKey = topPlayerKey;
+      const newField = [...prev[pKey].field];
+      newField[slotIndex] = evolvedMonster;
+      const newHand = prev[pKey].hand.filter((_, idx) => idx !== prev.selectedCardIndex);
 
-    // Remove played card from hand
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
+      let abilityLog = '';
+      const defField = [...prev[otherKey].field];
+      let defHp = prev[otherKey].hp;
 
-    // Apply special evolution ability
-    let abilityLog = '';
-    const defField = [...defendingPlayer.field];
-    let defHp = defendingPlayer.hp;
-
-    if (evolvedCardDef.id === 'fire_stage3') {
-      // Ignis Drake: 3 damage to all enemies!
-      for (let i = 0; i < defField.length; i++) {
-        const mon = defField[i];
-        if (mon) {
-          mon.currentDefense -= 3;
-          if (mon.currentDefense <= 0) {
-            defField[i] = null;
+      if (evolvedCardDef.id === 'fire_stage3') {
+        // Ignis Drake: 3 damage to all enemies!
+        for (let i = 0; i < defField.length; i++) {
+          const mon = defField[i];
+          if (mon) {
+            mon.currentDefense -= 3;
+            if (mon.currentDefense <= 0) {
+              defField[i] = null;
+            }
           }
         }
-      }
-      abilityLog = `🔥 Explosão de Meteoro do ${evolvedCardDef.name} causou 3 de dano a todas as criaturas inimigas!`;
-    } else if (evolvedCardDef.id === 'water_stage3') {
-      // Leviathorn: Freeze enemy
-      for (let i = 0; i < defField.length; i++) {
-        const mon = defField[i];
-        if (mon) {
-          mon.statusEffects.frozen = true;
-          break;
+        abilityLog = `🔥 Explosão de Meteoro do ${evolvedCardDef.name} causou 3 de dano a todas as criaturas inimigas!`;
+      } else if (evolvedCardDef.id === 'water_stage3') {
+        // Leviathorn: Freeze enemy
+        for (let i = 0; i < defField.length; i++) {
+          const mon = defField[i];
+          if (mon) {
+            mon.statusEffects.frozen = true;
+            break;
+          }
         }
-      }
-      abilityLog = `🌊 Onda Glacial do ${evolvedCardDef.name} congelou a criatura inimiga por 1 turno!`;
-    } else if (evolvedCardDef.id === 'elec_stage3') {
-      // Raijin: Direct zap
-      defHp = Math.max(0, defHp - 3);
-      abilityLog = `⚡ Tempestade de Raios atingiu ${defendingPlayer.name} diretamente com 3 de dano!`;
-    } else if (evolvedCardDef.id === 'mech_stage3') {
-      // Titanmech: +2 defense to all friendly monsters
-      newField.forEach((mon) => {
-        if (mon) {
-          mon.currentDefense += 2;
-          mon.maxDefense += 2;
+        abilityLog = `🌊 Onda Glacial do ${evolvedCardDef.name} congelou a criatura inimiga por 1 turno!`;
+      } else if (evolvedCardDef.id === 'elec_stage3') {
+        // Raijin: Direct zap
+        defHp = Math.max(0, defHp - 3);
+        abilityLog = `⚡ Tempestade de Raios atingiu ${prev[otherKey].name} diretamente com 3 de dano!`;
+      } else if (evolvedCardDef.id === 'mech_stage3') {
+        // Titanmech: +2 defense to all friendly monsters
+        newField.forEach((mon) => {
+          if (mon) {
+            mon.currentDefense += 2;
+            mon.maxDefense += 2;
+          }
+        });
+        abilityLog = `🛡️ Blindagem de Ferro reforçou todo o exército aliado com +2 de Defesa!`;
+      } else if (evolvedCardDef.id === 'fire_phoenix') {
+        // Phoenix: heal 3 HP to player and 2 damage to all enemies
+        prev[pKey].hp = Math.min(prev[pKey].maxHp, prev[pKey].hp + 3);
+        triggerHeal('bottom-player', 3);
+        for (let i = 0; i < defField.length; i++) {
+          const mon = defField[i];
+          if (mon) {
+            mon.currentDefense -= 2;
+            if (mon.currentDefense <= 0) defField[i] = null;
+          }
         }
-      });
-      abilityLog = `🛡️ Blindagem de Ferro reforçou todo o exército aliado com +2 de Defesa!`;
-    }
+        abilityLog = `🔥 Renascimento Flamejante curou 3 HP do duelista e causou 2 de dano aos inimigos!`;
+      } else if (evolvedCardDef.id === 'water_beast') {
+        // Kraken: -1 ATK to all enemy monsters
+        defField.forEach((mon) => {
+          if (mon) mon.currentAttack = Math.max(0, mon.currentAttack - 1);
+        });
+        abilityLog = `🌊 Redemoinho do Abismo reduziu o ataque de todos os monstros oponentes em 1!`;
+      } else if (evolvedCardDef.id === 'mech_behemoth') {
+        // Behemoth: +3 DEF to itself
+        evolvedMonster.currentDefense += 3;
+        evolvedMonster.maxDefense += 3;
+        abilityLog = `⚙️ Muralha Mecânica fortaleceu o Colosso com +3 de Defesa!`;
+      } else if (evolvedCardDef.id === 'elec_storm_dragon') {
+        // Storm Dragon: 3 direct damage
+        defHp = Math.max(0, defHp - 3);
+        abilityLog = `⚡ Sobrecarga de Trovão atingiu o duelista oponente causando 3 de dano direto!`;
+      } else if (evolvedCardDef.id === 'nature_stage2') {
+        // Silvanor: +2 DEF to all allies
+        newField.forEach((mon) => {
+          if (mon) {
+            mon.currentDefense += 2;
+            mon.maxDefense += 2;
+          }
+        });
+        abilityLog = `🌿 Bênção Verdejante concedeu +2 de Defesa a todos os monstros aliados!`;
+      } else if (evolvedCardDef.id === 'nature_stage3') {
+        // Gaia Colossus: +3 DEF heal to allies, 2 dmg to enemies
+        newField.forEach((mon) => {
+          if (mon) mon.currentDefense = Math.min(mon.maxDefense, mon.currentDefense + 3);
+        });
+        for (let i = 0; i < defField.length; i++) {
+          const mon = defField[i];
+          if (mon) {
+            mon.currentDefense -= 2;
+            if (mon.currentDefense <= 0) defField[i] = null;
+          }
+        }
+        abilityLog = `🌱 Raízes Vivas curou 3 de Defesa dos aliados e causou 2 de dano a todas as criaturas inimigas!`;
+      } else if (evolvedCardDef.id === 'dark_stage2') {
+        // Espectro: drain 1 ATK from enemy
+        for (let i = 0; i < defField.length; i++) {
+          const mon = defField[i];
+          if (mon && mon.currentAttack > 0) {
+            mon.currentAttack = Math.max(0, mon.currentAttack - 1);
+            evolvedMonster.currentAttack += 1;
+            break;
+          }
+        }
+        abilityLog = `🌑 Toque do Vazio drenou 1 de ataque de uma criatura inimiga!`;
+      } else if (evolvedCardDef.id === 'dark_stage3') {
+        // Void Lord: 3 damage to enemy player, heal 3 HP to own player
+        defHp = Math.max(0, defHp - 3);
+        prev[pKey].hp = Math.min(prev[pKey].maxHp, prev[pKey].hp + 3);
+        triggerHeal('bottom-player', 3);
+        abilityLog = `💀 Colheita Sombria causou 3 de dano ao oponente e restaurou 3 de HP do duelista!`;
+      }
 
-    triggerNotification(`✨ EVOLUÇÃO POKÉMON! ${targetMonster.card.name} evoluiu para ${evolvedCardDef.name}!`);
-
-    setBattle((prev) => {
-      const pKey = prev.currentTurn;
-      const otherKey = pKey === 'player1' ? 'player2' : 'player1';
       return {
         ...prev,
         [pKey]: {
@@ -321,6 +468,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       };
     });
 
+    triggerNotification(`✨ EVOLUÇÃO POKÉMON! ${targetMonster.card.name} evoluiu para ${evolvedCardDef.name}!`);
     setTargetMode(null);
   };
 
@@ -328,7 +476,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   const handleApplySpellFriendly = (slotIndex: number) => {
     if (battle.selectedCardIndex === null || !targetMode?.spellCard) return;
     const card = targetMode.spellCard;
-    const targetMonster = activePlayer.field[slotIndex];
+    const targetMonster = bottomPlayer.field[slotIndex];
 
     if (!targetMonster) return;
 
@@ -378,21 +526,29 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         updatedMonster.isReady = true;
         logMsg = `⚡ Charge! concedeu um ataque adicional a ${targetMonster.card.name}!`;
         break;
+      case 'berserk':
+        updatedMonster.currentAttack += 4;
+        logMsg = `💢 Fúria Berserker concedeu +4 de ataque a ${targetMonster.card.name}!`;
+        break;
+      case 'thorns':
+        updatedMonster.currentDefense += 3;
+        updatedMonster.maxDefense += 3;
+        logMsg = `🌿 Armadura de Espinhos concedeu +3 de defesa a ${targetMonster.card.name}!`;
+        break;
       case 'summon':
         updatedMonster.summonTurnsLeft = 0;
         updatedMonster.isReady = true;
         logMsg = `⏳ Summon Fast despertou ${targetMonster.card.name} instantaneamente!`;
         break;
       case 'sacrifice':
-        // Sacrifices monster to heal player
         {
-          const newField = [...activePlayer.field];
+          const newField = [...bottomPlayer.field];
           newField[slotIndex] = null;
-          const newHp = Math.min(activePlayer.maxHp, activePlayer.hp + 6);
-          const newHand = activePlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
+          const newHp = Math.min(bottomPlayer.maxHp, bottomPlayer.hp + 6);
+          const newHand = bottomPlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
 
           setBattle((prev) => {
-            const pKey = prev.currentTurn;
+            const pKey = bottomPlayerKey;
             return {
               ...prev,
               [pKey]: {
@@ -415,12 +571,12 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         break;
     }
 
-    const newField = [...activePlayer.field];
+    const newField = [...bottomPlayer.field];
     newField[slotIndex] = updatedMonster;
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
 
     setBattle((prev) => {
-      const pKey = prev.currentTurn;
+      const pKey = bottomPlayerKey;
       return {
         ...prev,
         [pKey]: {
@@ -440,7 +596,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   const handleApplySpellEnemy = (slotIndex: number) => {
     if (battle.selectedCardIndex === null || !targetMode?.spellCard) return;
     const card = targetMode.spellCard;
-    const targetMonster = defendingPlayer.field[slotIndex];
+    const targetMonster = topPlayer.field[slotIndex];
 
     if (!targetMonster) return;
 
@@ -467,6 +623,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         updatedMonster.currentDefense -= 2;
         logMsg = `🔮 Curse reduziu em 2 o ataque e defesa de ${targetMonster.card.name}!`;
         break;
+      case 'earthquake':
+        updatedMonster.currentDefense -= 3;
+        updatedMonster.currentAttack = Math.max(0, updatedMonster.currentAttack - 1);
+        logMsg = `🌋 Terremoto causou 3 de dano e reduziu o ataque de ${targetMonster.card.name}!`;
+        break;
       default:
         break;
     }
@@ -476,14 +637,14 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       logMsg += ` 💀 ${targetMonster.card.name} foi destruído!`;
     }
 
-    const newEnemyField = [...defendingPlayer.field];
+    const newEnemyField = [...topPlayer.field];
     newEnemyField[slotIndex] = isDestroyed ? null : updatedMonster;
 
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== battle.selectedCardIndex);
 
     setBattle((prev) => {
-      const pKey = prev.currentTurn;
-      const otherKey = pKey === 'player1' ? 'player2' : 'player1';
+      const pKey = bottomPlayerKey;
+      const otherKey = topPlayerKey;
       return {
         ...prev,
         [pKey]: {
@@ -502,10 +663,76 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
     setTargetMode(null);
   };
 
+  // Tsunami wave wipe on enemy field
+  const applyTsunami = (cardIndex: number) => {
+    sound.playSpellCast();
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== cardIndex);
+
+    setBattle((prev) => {
+      const otherKey = topPlayerKey;
+      const pKey = bottomPlayerKey;
+      const updatedField = prev[otherKey].field.map((mon) => {
+        if (!mon) return null;
+        const newDef = mon.currentDefense - 2;
+        if (newDef <= 0) return null;
+        return { ...mon, currentDefense: newDef };
+      });
+
+      return {
+        ...prev,
+        [pKey]: {
+          ...prev[pKey],
+          hand: newHand,
+        },
+        [otherKey]: {
+          ...prev[otherKey],
+          field: updatedField,
+        },
+        selectedCardIndex: null,
+        combatLog: [
+          `🌊 TSUNAMI ANCESTRAL! Uma onda gigante varreu o campo inimigo causando 2 de dano em todas as criaturas!`,
+          ...prev.combatLog,
+        ],
+      };
+    });
+  };
+
+  // Arcane Barrier on ally field
+  const applyArcaneBarrier = (cardIndex: number) => {
+    sound.playSpellCast();
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== cardIndex);
+
+    setBattle((prev) => {
+      const pKey = bottomPlayerKey;
+      const updatedField = prev[pKey].field.map((mon) => {
+        if (!mon) return null;
+        return {
+          ...mon,
+          currentDefense: mon.currentDefense + 2,
+          maxDefense: mon.maxDefense + 2,
+        };
+      });
+
+      return {
+        ...prev,
+        [pKey]: {
+          ...prev[pKey],
+          hand: newHand,
+          field: updatedField,
+        },
+        selectedCardIndex: null,
+        combatLog: [
+          `🛡️ BARREIRA ARCANA! Um domo de força protegeu todos os seus monstros aliados com +2 de Defesa!`,
+          ...prev.combatLog,
+        ],
+      };
+    });
+  };
+
   // Black Hole wipe
   const applyBlackHole = (cardIndex: number) => {
     sound.playAttackHit();
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== cardIndex);
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== cardIndex);
 
     setBattle((prev) => ({
       ...prev,
@@ -530,11 +757,12 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   // Player restore heal
   const applyPlayerRestore = (cardIndex: number, amount: number) => {
     sound.playSpellCast();
-    const newHand = activePlayer.hand.filter((_, idx) => idx !== cardIndex);
-    const newHp = Math.min(activePlayer.maxHp, activePlayer.hp + amount);
+    triggerHeal('bottom-player', amount);
+    const newHand = bottomPlayer.hand.filter((_, idx) => idx !== cardIndex);
+    const newHp = Math.min(bottomPlayer.maxHp, bottomPlayer.hp + amount);
 
     setBattle((prev) => {
-      const pKey = prev.currentTurn;
+      const pKey = bottomPlayerKey;
       return {
         ...prev,
         [pKey]: {
@@ -554,7 +782,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
   // Select friendly monster on board to initiate an attack
   const handleSelectAttackingMonster = (slotIndex: number) => {
     if (battle.winner) return;
-    const monster = activePlayer.field[slotIndex];
+    if (battle.currentTurn !== bottomPlayerKey) {
+      triggerNotification('Espere a sua vez de jogar!');
+      return;
+    }
+    const monster = bottomPlayer.field[slotIndex];
     if (!monster) return;
 
     if (monster.summonTurnsLeft > 0) {
@@ -583,82 +815,73 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       setTargetMode({ type: 'monster_attack', sourceSlot: slotIndex });
 
       // Check if enemy has monsters on field
-      const enemyHasMonsters = defendingPlayer.field.some((m) => m !== null);
+      const enemyHasMonsters = topPlayer.field.some((m) => m !== null);
       if (enemyHasMonsters) {
         triggerNotification(`Escolha qual monstro inimigo atacar com ${monster.card.name}!`);
       } else {
-        triggerNotification(`Campo inimigo vazio! Você pode atacar o líder ${defendingPlayer.name} diretamente!`);
+        triggerNotification(`Campo inimigo livre! Ataque o duelista ${topPlayer.name} diretamente!`);
       }
     }
   };
 
-  // Execute attack against an enemy monster
+  // Execute attack against an enemy monster (Attacker deals damage, offensive initiative)
   const handleAttackEnemyMonster = (targetSlot: number) => {
     if (battle.selectedFieldSlot === null || targetMode?.type !== 'monster_attack') return;
-    const attacker = activePlayer.field[battle.selectedFieldSlot];
-    const defender = defendingPlayer.field[targetSlot];
+    const attacker = bottomPlayer.field[battle.selectedFieldSlot];
+    const defender = topPlayer.field[targetSlot];
 
     if (!attacker || !defender) return;
 
     sound.playAttackHit();
 
     // Damage calculation: Attacker deals ATK to Defender's DEF
-    // Defender also counterattacks dealing its ATK to Attacker's DEF!
     const newDefenderDef = defender.currentDefense - attacker.currentAttack;
-    const newAttackerDef = attacker.currentDefense - defender.currentAttack;
-
     let log = `⚔️ ${attacker.card.name} atacou ${defender.card.name} causando ${attacker.currentAttack} de dano!`;
 
-    const updatedDefender = { ...defender, currentDefense: newDefenderDef };
-    const updatedAttacker = { ...attacker, currentDefense: newAttackerDef, hasAttacked: true };
+    // Trigger visual lunge and floating numbers
+    const sourceKey = `bottom-slot-${battle.selectedFieldSlot}`;
+    const targetKey = `top-slot-${targetSlot}`;
+    triggerCombatDamage(sourceKey, targetKey, attacker.currentAttack, newDefenderDef <= 0, false);
 
-    const newDefendingField = [...defendingPlayer.field];
-    const newActiveField = [...activePlayer.field];
+    const updatedDefender = { ...defender, currentDefense: newDefenderDef };
+    const updatedAttacker = { ...attacker, hasAttacked: true };
+
+    const newDefendingField = [...topPlayer.field];
+    const newActiveField = [...bottomPlayer.field];
 
     if (newDefenderDef <= 0) {
       newDefendingField[targetSlot] = null;
       log += ` 💀 ${defender.card.name} foi eliminado!`;
     } else {
       newDefendingField[targetSlot] = updatedDefender;
-      log += ` (Contra-ataque: ${defender.card.name} causou ${defender.currentAttack} de dano)`;
     }
 
-    if (newAttackerDef <= 0) {
-      newActiveField[battle.selectedFieldSlot] = null;
-      log += ` 💀 ${attacker.card.name} caiu no contra-ataque!`;
-    } else {
-      newActiveField[battle.selectedFieldSlot] = updatedAttacker;
-    }
+    newActiveField[battle.selectedFieldSlot] = updatedAttacker;
 
-    setBattle((prev) => {
-      const pKey = prev.currentTurn;
-      const otherKey = pKey === 'player1' ? 'player2' : 'player1';
-      return {
-        ...prev,
-        [pKey]: {
-          ...prev[pKey],
-          field: newActiveField,
-        },
-        [otherKey]: {
-          ...prev[otherKey],
-          field: newDefendingField,
-        },
-        selectedFieldSlot: null,
-        combatLog: [log, ...prev.combatLog],
-      };
-    });
-
-    setTargetMode(null);
+    setBattle((prev) => ({
+      ...prev,
+      [bottomPlayerKey]: {
+        ...prev[bottomPlayerKey],
+        field: newActiveField,
+      },
+      [topPlayerKey]: {
+        ...prev[topPlayerKey],
+        field: newDefendingField,
+      },
+      selectedFieldSlot: null,
+      targetMode: null,
+      combatLog: [log, ...prev.combatLog],
+    }));
   };
 
   // Execute direct attack on enemy player (when field is open)
   const handleDirectAttackPlayer = () => {
     if (battle.selectedFieldSlot === null || targetMode?.type !== 'monster_attack') return;
-    const attacker = activePlayer.field[battle.selectedFieldSlot];
+    const attacker = bottomPlayer.field[battle.selectedFieldSlot];
     if (!attacker) return;
 
     // Check if enemy has monsters blocking
-    const enemyHasMonsters = defendingPlayer.field.some((m) => m !== null);
+    const enemyHasMonsters = topPlayer.field.some((m) => m !== null);
     if (enemyHasMonsters) {
       triggerNotification('Você precisa destruir os monstros inimigos antes de atacar o duelista diretamente!');
       return;
@@ -667,32 +890,31 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
     sound.playAttackHit();
 
     const damage = attacker.currentAttack;
-    const newEnemyHp = Math.max(0, defendingPlayer.hp - damage);
+    const sourceKey = `bottom-slot-${battle.selectedFieldSlot}`;
+    const targetKey = 'top-player';
+    triggerCombatDamage(sourceKey, targetKey, damage, false, true);
 
-    const newActiveField = [...activePlayer.field];
+    const newEnemyHp = Math.max(0, topPlayer.hp - damage);
+
+    const newActiveField = [...bottomPlayer.field];
     newActiveField[battle.selectedFieldSlot] = { ...attacker, hasAttacked: true };
 
-    const log = `💥 ATAQUE DIRETO! ${attacker.card.name} atacou ${defendingPlayer.name} diretamente causando ${damage} de dano!`;
+    const log = `💥 ATAQUE DIRETO! ${attacker.card.name} atacou ${topPlayer.name} diretamente causando ${damage} de dano!`;
 
-    setBattle((prev) => {
-      const pKey = prev.currentTurn;
-      const otherKey = pKey === 'player1' ? 'player2' : 'player1';
-      return {
-        ...prev,
-        [pKey]: {
-          ...prev[pKey],
-          field: newActiveField,
-        },
-        [otherKey]: {
-          ...prev[otherKey],
-          hp: newEnemyHp,
-        },
-        selectedFieldSlot: null,
-        combatLog: [log, ...prev.combatLog],
-      };
-    });
-
-    setTargetMode(null);
+    setBattle((prev) => ({
+      ...prev,
+      [bottomPlayerKey]: {
+        ...prev[bottomPlayerKey],
+        field: newActiveField,
+      },
+      [topPlayerKey]: {
+        ...prev[topPlayerKey],
+        hp: newEnemyHp,
+      },
+      selectedFieldSlot: null,
+      targetMode: null,
+      combatLog: [log, ...prev.combatLog],
+    }));
   };
 
   // Classic Monster Master Turn Spinner End Turn Handler
@@ -702,76 +924,90 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
     sound.playTurnEnd();
     setTargetMode(null);
 
-    const nextTurn = battle.currentTurn === 'player1' ? 'player2' : 'player1';
-    const nextPlayerObj = nextTurn === 'player1' ? battle.player1 : battle.player2;
+    setBattle((prev) => {
+      const nextTurn = prev.currentTurn === 'player1' ? 'player2' : 'player1';
+      const outgoingKey = prev.currentTurn;
+      const incomingKey = nextTurn;
 
-    // 1. Process upkeep ONLY for the player whose turn is starting:
-    // Decrement summon turns on monsters
-    const updatedField = nextPlayerObj.field.map((mon) => {
-      if (!mon) return null;
-      let newSummonTurns = mon.summonTurnsLeft;
-      let ready = mon.isReady;
+      const incomingPlayer = prev[incomingKey];
+      const outgoingPlayer = prev[outgoingKey];
 
-      if (newSummonTurns > 0) {
-        newSummonTurns -= 1;
-        if (newSummonTurns === 0) {
-          ready = true;
+      // 1. Process upkeep ONLY for incoming player:
+      const updatedIncomingField = incomingPlayer.field.map((mon) => {
+        if (!mon) return null;
+        let st = mon.summonTurnsLeft;
+        let ready = mon.isReady;
+
+        if (st > 0) {
+          st -= 1;
+          if (st === 0) {
+            ready = true;
+          }
         }
+
+        let def = mon.currentDefense;
+        if (mon.statusEffects?.poisoned && mon.statusEffects.poisoned > 0) {
+          def -= mon.statusEffects.poisoned;
+          if (def <= 0) return null;
+        }
+
+        return {
+          ...mon,
+          summonTurnsLeft: st,
+          isReady: ready,
+          hasAttacked: false, // Ready to attack on their turn!
+          currentDefense: def,
+          statusEffects: {
+            ...mon.statusEffects,
+            frozen: false,
+          },
+        };
+      });
+
+      // Reset hasAttacked flags for outgoing player as well so state stays clean
+      const updatedOutgoingField = outgoingPlayer.field.map((mon) => {
+        if (!mon) return null;
+        return {
+          ...mon,
+          hasAttacked: false,
+        };
+      });
+
+      // 2. Draw card for incoming player
+      let nextHand = [...incomingPlayer.hand];
+      let nextDeck = [...incomingPlayer.deck];
+
+      if (nextDeck.length > 0 && nextHand.length < 6) {
+        sound.playCardDraw();
+        const drawnCard = nextDeck[0];
+        nextDeck = nextDeck.slice(1);
+        nextHand.push(drawnCard);
       }
 
-      // Process poison damage ONLY if the monster is actually poisoned
-      let def = mon.currentDefense;
-      if (mon.statusEffects?.poisoned && mon.statusEffects.poisoned > 0) {
-        def -= mon.statusEffects.poisoned;
-        if (def <= 0) return null; // Only dies if poisoned to 0!
-      }
+      const isPassAndPlay = prev.mode === 'pass_and_play';
 
       return {
-        ...mon,
-        summonTurnsLeft: newSummonTurns,
-        isReady: ready,
-        hasAttacked: false, // Reset attack state for new turn
-        currentDefense: def,
-        statusEffects: {
-          ...mon.statusEffects,
-          frozen: false, // Thaws
-        },
-      };
-    });
-
-    // 2. Draw 1 card from deck if available
-    let nextHand = [...nextPlayerObj.hand];
-    let nextDeck = [...nextPlayerObj.deck];
-
-    if (nextDeck.length > 0 && nextHand.length < 6) {
-      sound.playCardDraw();
-      const drawnCard = nextDeck[0];
-      nextDeck = nextDeck.slice(1);
-      nextHand.push(drawnCard);
-    }
-
-    const isPassAndPlay = battle.mode === 'pass_and_play';
-
-    setBattle((prev) => {
-      const nextTurnState: BattleState = {
         ...prev,
         turnNumber: nextTurn === 'player1' ? prev.turnNumber + 1 : prev.turnNumber,
         currentTurn: nextTurn,
-        [nextTurn]: {
-          ...prev[nextTurn],
+        [incomingKey]: {
+          ...incomingPlayer,
           hand: nextHand,
           deck: nextDeck,
-          field: updatedField,
+          field: updatedIncomingField,
+        },
+        [outgoingKey]: {
+          ...outgoingPlayer,
+          field: updatedOutgoingField,
         },
         selectedCardIndex: null,
         selectedFieldSlot: null,
-        waitingForPassHandover: isPassAndPlay, // Triggers privacy screen if local pass and play!
+        waitingForPassHandover: isPassAndPlay,
         combatLog: [
-          `🔄 Turno ${prev.turnNumber}: Vez de ${prev[nextTurn].name}!`,
+          `🔄 Turno ${nextTurn === 'player1' ? prev.turnNumber + 1 : prev.turnNumber}: Vez de ${incomingPlayer.name}!`,
           ...prev.combatLog,
         ],
       };
-      return nextTurnState;
     });
   };
 
@@ -858,11 +1094,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
               instanceId: `ai_${Date.now()}_${Math.random()}`,
               card,
               currentAttack: card.attack,
-              currentDefense: card.defense,
-              maxDefense: card.maxDefense,
+              currentDefense: card.defense || card.maxDefense || 2,
+              maxDefense: card.maxDefense || card.defense || 2,
               summonTurnsLeft: card.summonTurns,
               isReady: card.summonTurns === 0,
-              hasAttacked: false,
+              hasAttacked: true, // Summoning sickness: cannot attack in the same turn it enters!
               statusEffects: {},
             };
             newAiHand.splice(hIdx, 1);
@@ -926,10 +1162,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         if (humanTargetIdx !== -1) {
           const humanMon = newHumanField[humanTargetIdx]!;
           const newDefDef = humanMon.currentDefense - mon.currentAttack;
-          const newAtkDef = mon.currentDefense - humanMon.currentAttack;
 
           mon.hasAttacked = true;
           logs.push(`⚔️ ${mon.card.name} do oponente atacou seu ${humanMon.card.name}!`);
+
+          triggerCombatDamage(`top-slot-${aSlot}`, `bottom-slot-${humanTargetIdx}`, mon.currentAttack, newDefDef <= 0, false);
 
           if (newDefDef <= 0) {
             newHumanField[humanTargetIdx] = null;
@@ -937,18 +1174,13 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
           } else {
             newHumanField[humanTargetIdx] = { ...humanMon, currentDefense: newDefDef };
           }
-
-          if (newAtkDef <= 0) {
-            newAiField[aSlot] = null;
-            logs.push(`💀 ${mon.card.name} do oponente caiu no contra-ataque!`);
-          } else {
-            mon.currentDefense = newAtkDef;
-          }
         } else {
           // Direct attack on human player!
           newHumanHp = Math.max(0, newHumanHp - mon.currentAttack);
           mon.hasAttacked = true;
           logs.push(`💥 ATAQUE DIRETO: ${mon.card.name} atingiu você causando ${mon.currentAttack} de dano!`);
+
+          triggerCombatDamage(`top-slot-${aSlot}`, 'bottom-player', mon.currentAttack, false, true);
         }
       }
 
@@ -1070,27 +1302,43 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
       )}
 
       {/* ========================================================================= */}
-      {/* TOP ZONE: OPPONENT / PLAYER 2 */}
+      {/* TOP ZONE: OPPONENT / DEFENDING PLAYER (Or Player 1 when Player 2's turn in Pass & Play) */}
       {/* ========================================================================= */}
       <div className="relative z-10 p-3 sm:p-4 bg-slate-950/60 border-b border-rose-950/40 flex flex-col gap-2">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {/* Opponent Portrait */}
-            <div className="w-12 h-12 rounded-xl bg-rose-950/80 border-2 border-rose-500/50 flex items-center justify-center text-2xl shadow-lg">
-              {battle.player2.avatar || '🤖'}
+            <div className={`relative w-12 h-12 rounded-xl bg-rose-950/80 border-2 border-rose-500/50 flex items-center justify-center text-2xl shadow-lg transition-all ${
+              hitTargetKey === 'top-player' ? 'animate-shake ring-4 ring-rose-500 shadow-rose-500/60' : ''
+            }`}>
+              {topPlayer.avatar || '🤖'}
+              {hitTargetKey === 'top-player' && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <span className="text-3xl animate-slash select-none">💥</span>
+                </div>
+              )}
+              {floatingTexts
+                .filter((f) => f.targetKey === 'top-player')
+                .map((f) => (
+                  <div key={f.id} className="absolute -top-3 left-1/2 -translate-x-1/2 pointer-events-none z-40 animate-float-damage whitespace-nowrap">
+                    <span className={`text-sm sm:text-base font-black drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${f.color}`}>
+                      {f.text}
+                    </span>
+                  </div>
+                ))}
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-white tracking-wide text-sm sm:text-base">
-                  {battle.player2.name}
+                  {topPlayer.name}
                 </span>
-                {battle.currentTurn === 'player2' && (
+                {battle.currentTurn === topPlayerKey && (
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-600/40 text-rose-300 border border-rose-500/30 animate-pulse">
                     VEZ DELE
                   </span>
                 )}
               </div>
-              {renderHealthBar(battle.player2.hp, battle.player2.maxHp)}
+              {renderHealthBar(topPlayer.hp, topPlayer.maxHp)}
             </div>
           </div>
 
@@ -1098,63 +1346,151 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
           <div className="flex items-center gap-4 text-xs text-slate-400">
             <div className="flex items-center gap-1 font-mono">
               <span className="text-slate-500">Mão:</span>
-              <span className="text-white font-bold">{battle.player2.hand.length} cartas</span>
+              <span className="text-white font-bold">{topPlayer.hand.length} cartas</span>
             </div>
             <div className="flex items-center gap-1 font-mono">
               <span className="text-slate-500">Deck:</span>
-              <span className="text-white font-bold">{battle.player2.deck.length}</span>
+              <span className="text-white font-bold">{topPlayer.deck.length}</span>
             </div>
           </div>
         </div>
 
         {/* Opponent Field Slots (5 slots) */}
         <div className="flex items-center justify-center gap-2 sm:gap-4 py-2">
-          {battle.player2.field.map((monster, idx) => (
-            <div
-              key={idx}
-              onClick={() => {
-                if (targetMode?.type === 'monster_attack') {
-                  handleAttackEnemyMonster(idx);
-                } else if (targetMode?.type === 'spell_enemy') {
-                  handleApplySpellEnemy(idx);
-                }
-              }}
-              className={`w-20 h-28 sm:w-28 sm:h-38 rounded-lg border-2 flex items-center justify-center transition-all ${
-                monster
-                  ? 'border-rose-500/70 bg-slate-900 shadow-md'
-                  : 'border-dashed border-rose-900/40 bg-black/30'
-              } ${
-                targetMode && monster
-                  ? 'cursor-pointer hover:border-amber-400 hover:scale-105 ring-2 ring-amber-400/50'
-                  : ''
-              }`}
-            >
-              {monster ? (
-                <div className="w-full h-full p-1 relative flex flex-col justify-between">
-                  <div className="text-[10px] font-bold text-white truncate">{monster.card.name}</div>
-                  <div className="flex-1 flex items-center justify-center my-0.5 overflow-hidden rounded bg-black/40">
-                    {monster.card.image ? (
-                      <img src={monster.card.image} alt={monster.card.name} className="w-full h-full object-cover" />
+          {topPlayer.field.map((monster, idx) => {
+            const slotKey = `top-slot-${idx}`;
+            const isAttacking = attackingSlotKey === slotKey;
+            const isHit = hitTargetKey === slotKey;
+            const elem = monster ? getElementColors(monster.card.element) : null;
+            const isTargetable = (targetMode?.type === 'monster_attack' || targetMode?.type === 'spell_enemy') && monster;
+
+            return (
+              <div
+                key={idx}
+                onClick={() => {
+                  if (isLongPressActiveRef.current) {
+                    isLongPressActiveRef.current = false;
+                    return;
+                  }
+                  if (targetMode?.type === 'monster_attack') {
+                    handleAttackEnemyMonster(idx);
+                  } else if (targetMode?.type === 'spell_enemy') {
+                    handleApplySpellEnemy(idx);
+                  }
+                }}
+                className={`relative w-20 h-28 sm:w-28 sm:h-38 rounded-xl border-2 flex items-center justify-center transition-all select-none ${
+                  monster && elem
+                    ? `${elem.bg} ${elem.border} ${elem.glow} shadow-lg`
+                    : 'border-dashed border-rose-900/40 bg-black/40'
+                } ${
+                  isAttacking ? 'animate-lunge-down z-30' : ''
+                } ${
+                  isHit ? 'animate-shake ring-4 ring-rose-500 shadow-rose-500/50' : ''
+                } ${
+                  isTargetable
+                    ? 'cursor-pointer hover:border-amber-400 hover:scale-105 ring-2 ring-amber-400/80 animate-pulse'
+                    : ''
+                }`}
+              >
+                {monster && elem ? (
+                  <div
+                    onMouseEnter={() => setHoveredCard(monster.card)}
+                    onMouseLeave={() => setHoveredCard(null)}
+                    onTouchStart={() => startLongPress(monster.card)}
+                    onTouchEnd={cancelLongPress}
+                    onTouchMove={cancelLongPress}
+                    onTouchCancel={cancelLongPress}
+                    className="w-full h-full p-1 sm:p-1.5 relative flex flex-col justify-between"
+                  >
+                    {/* Top Tag: Name & Element Icon */}
+                    <div className="flex items-center justify-between gap-1">
+                      <div className="flex items-center gap-1 truncate max-w-[80%]">
+                        <span className="text-[10px] sm:text-xs font-black text-white truncate drop-shadow">
+                          {monster.card.name}
+                        </span>
+                      </div>
+                      <span
+                        className="text-[9px] px-1 rounded font-bold uppercase tracking-wider shrink-0 flex items-center gap-0.5"
+                        style={{ backgroundColor: `${elem.accent}33`, color: elem.accent }}
+                        title={elem.name}
+                      >
+                        {elem.icon}
+                      </span>
+                    </div>
+
+                    {/* Center Artwork */}
+                    <div className="relative flex-1 my-0.5 sm:my-1 overflow-hidden rounded-md bg-black/50 border border-white/10 flex items-center justify-center">
+                      {monster.card.image ? (
+                        <img
+                          src={monster.card.image}
+                          alt={monster.card.name}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <span className="text-xl sm:text-2xl">{elem.icon}</span>
+                      )}
+
+                      {/* Stage indicator */}
+                      {monster.card.stage > 1 && (
+                        <div className="absolute top-0.5 left-0.5 px-1 rounded bg-amber-400 text-black text-[8px] font-black">
+                          E{monster.card.stage}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Bottom Status / Stats */}
+                    {monster.summonTurnsLeft > 0 ? (
+                      <div className="text-[9px] sm:text-[10px] text-amber-300 font-mono bg-black/80 rounded px-1 py-0.5 text-center font-bold border border-amber-500/40">
+                        ⏳ {monster.summonTurnsLeft}t carga
+                      </div>
                     ) : (
-                      <span className="text-xl">👾</span>
+                      <div className="flex items-center justify-between text-[10px] sm:text-xs font-mono font-black bg-black/60 rounded px-1 py-0.5 border border-white/10">
+                        <span className="text-rose-400 drop-shadow">⚔️{monster.currentAttack}</span>
+                        <span className="text-cyan-400 drop-shadow">🛡️{monster.currentDefense}</span>
+                      </div>
                     )}
+
+                    {/* Quick Detail Zoom Button (explicit tap/click to view without holding) */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInspectedCard(monster.card);
+                      }}
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-slate-900 border border-amber-400 text-amber-300 text-[10px] flex items-center justify-center shadow opacity-80 hover:opacity-100 hover:scale-110 active:scale-95 z-20 cursor-pointer"
+                      title="Segure para ampliar ou clique para detalhes"
+                    >
+                      🔍
+                    </button>
                   </div>
-                  {monster.summonTurnsLeft > 0 ? (
-                    <div className="text-[9px] text-amber-400 font-mono bg-black/80 rounded px-1 py-0.5 text-center font-bold">
-                      {monster.summonTurnsLeft}t carga
+                ) : (
+                  <span className="text-[10px] text-rose-800/60 font-mono">Vazio</span>
+                )}
+
+                {/* Floating Combat Text for this slot */}
+                {floatingTexts
+                  .filter((f) => f.targetKey === slotKey)
+                  .map((f) => (
+                    <div
+                      key={f.id}
+                      className="absolute inset-0 pointer-events-none z-40 flex items-center justify-center animate-float-damage"
+                    >
+                      <span className={`text-base sm:text-xl font-black drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${f.color}`}>
+                        {f.text}
+                      </span>
                     </div>
-                  ) : (
-                    <div className="flex items-center justify-between text-[10px] font-mono px-0.5 font-bold">
-                      <span className="text-rose-400">⚔️{monster.currentAttack}</span>
-                      <span className="text-cyan-400">🛡️{monster.currentDefense}</span>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <span className="text-[10px] text-rose-800/60 font-mono">Vazio</span>
-              )}
-            </div>
-          ))}
+                  ))}
+
+                {/* Slash Particle on Hit */}
+                {isHit && (
+                  <div className="absolute inset-0 pointer-events-none z-30 flex items-center justify-center">
+                    <span className="text-3xl sm:text-5xl animate-slash select-none">⚔️</span>
+                    <div className="absolute inset-0 bg-rose-500/35 rounded-xl animate-pulse" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -1187,7 +1523,11 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
               Turno {battle.turnNumber}
             </span>
             <div className="text-xs sm:text-sm font-bold text-amber-400 flex items-center justify-center gap-1.5">
-              <span>{battle.currentTurn === 'player1' ? `Sua Vez (${battle.player1.name})` : `Vez de ${battle.player2.name}`}</span>
+              <span>
+                {battle.currentTurn === bottomPlayerKey
+                  ? `Sua Vez (${bottomPlayer.name})`
+                  : `Vez de ${topPlayer.name}`}
+              </span>
               {battle.currentTurn === 'player2' && (battle.mode === 'story' || battle.mode === 'online_ranked') && (
                 <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-ping" />
               )}
@@ -1200,7 +1540,7 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
           </div>
 
           {/* Direct Attack Opportunity Button */}
-          {targetMode?.type === 'monster_attack' && !defendingPlayer.field.some((m) => m !== null) && (
+          {targetMode?.type === 'monster_attack' && !topPlayer.field.some((m) => m !== null) && (
             <button
               onClick={handleDirectAttackPlayer}
               className="px-4 py-2 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white font-extrabold text-xs sm:text-sm animate-pulse shadow-lg shadow-rose-600/40 cursor-pointer flex items-center gap-1.5"
@@ -1215,32 +1555,42 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         <div className="flex items-center gap-2">
           <button
             onClick={handleEndTurn}
-            disabled={battle.currentTurn !== 'player1' && battle.mode !== 'pass_and_play'}
+            disabled={battle.mode !== 'pass_and_play' && battle.currentTurn !== 'player1'}
             className="group relative w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-gradient-to-br from-amber-500 via-orange-500 to-amber-600 hover:from-amber-400 hover:to-orange-400 border-2 border-amber-300 shadow-xl shadow-amber-500/40 flex items-center justify-center transition-transform active:scale-90 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             title="Encerrar Turno (Girar)"
           >
             <RotateCw className="w-6 h-6 sm:w-7 sm:h-7 text-slate-950 font-bold transition-transform duration-500 group-hover:rotate-180" />
             <span className="absolute -bottom-5 text-[9px] font-bold text-amber-300 uppercase tracking-tighter whitespace-nowrap">
-              Passar
+              {battle.mode === 'pass_and_play'
+                ? (battle.currentTurn === 'player1' ? 'Passar P2' : 'Passar P1')
+                : 'Passar'}
             </span>
           </button>
         </div>
       </div>
 
       {/* ========================================================================= */}
-      {/* BOTTOM ZONE: PLAYER 1 / LOCAL PLAYER */}
+      {/* BOTTOM ZONE: ACTIVE / LOCAL PLAYER (Device Owner) */}
       {/* ========================================================================= */}
       <div className="relative z-10 p-3 sm:p-4 bg-slate-950/70 border-t border-cyan-950/50 flex flex-col gap-2">
         {/* Player Field Slots (5 slots) */}
         <div className="flex items-center justify-center gap-2 sm:gap-4 py-1">
-          {battle.player1.field.map((monster, idx) => {
+          {bottomPlayer.field.map((monster, idx) => {
+            const slotKey = `bottom-slot-${idx}`;
+            const isAttacking = attackingSlotKey === slotKey;
+            const isHit = hitTargetKey === slotKey;
+            const elem = monster ? getElementColors(monster.card.element) : null;
             const isSelected = battle.selectedFieldSlot === idx;
-            const canAttack = monster && monster.summonTurnsLeft === 0 && !monster.hasAttacked && battle.currentTurn === 'player1';
+            const canAttack = monster && monster.summonTurnsLeft === 0 && !monster.hasAttacked && battle.currentTurn === bottomPlayerKey;
 
             return (
               <div
                 key={idx}
                 onClick={() => {
+                  if (isLongPressActiveRef.current) {
+                    isLongPressActiveRef.current = false;
+                    return;
+                  }
                   if (targetMode?.type === 'spell_friendly') {
                     handleApplySpellFriendly(idx);
                   } else if (battle.selectedCardIndex !== null && !monster) {
@@ -1249,10 +1599,14 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
                     handleSelectAttackingMonster(idx);
                   }
                 }}
-                className={`w-20 h-28 sm:w-28 sm:h-38 rounded-lg border-2 flex items-center justify-center transition-all ${
-                  monster
-                    ? 'border-cyan-500/80 bg-slate-900 shadow-lg shadow-cyan-950/30'
+                className={`relative w-20 h-28 sm:w-28 sm:h-38 rounded-xl border-2 flex items-center justify-center transition-all select-none ${
+                  monster && elem
+                    ? `${elem.bg} ${elem.border} ${elem.glow} shadow-lg`
                     : 'border-dashed border-cyan-900/50 bg-black/40 hover:border-cyan-400 cursor-pointer'
+                } ${
+                  isAttacking ? 'animate-lunge-up z-30' : ''
+                } ${
+                  isHit ? 'animate-shake ring-4 ring-rose-500 shadow-rose-500/50' : ''
                 } ${
                   isSelected ? 'ring-4 ring-amber-400 -translate-y-1' : ''
                 } ${
@@ -1263,39 +1617,102 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
                     : ''
                 }`}
               >
-                {monster ? (
-                  <div className="w-full h-full p-1 relative flex flex-col justify-between">
-                    <div className="text-[10px] font-bold text-white truncate flex items-center justify-between">
-                      <span className="truncate">{monster.card.name}</span>
-                      {monster.card.stage > 1 && (
-                        <span className="text-[8px] bg-amber-500/80 text-black px-1 rounded font-bold">
-                          E{monster.card.stage}
+                {monster && elem ? (
+                  <div
+                    onMouseEnter={() => setHoveredCard(monster.card)}
+                    onMouseLeave={() => setHoveredCard(null)}
+                    onTouchStart={() => startLongPress(monster.card)}
+                    onTouchEnd={cancelLongPress}
+                    onTouchMove={cancelLongPress}
+                    onTouchCancel={cancelLongPress}
+                    className="w-full h-full p-1 sm:p-1.5 relative flex flex-col justify-between"
+                  >
+                    {/* Top Tag: Name & Element Icon */}
+                    <div className="flex items-center justify-between gap-1">
+                      <div className="flex items-center gap-1 truncate max-w-[80%]">
+                        <span className="text-[10px] sm:text-xs font-black text-white truncate drop-shadow">
+                          {monster.card.name}
                         </span>
-                      )}
+                      </div>
+                      <span
+                        className="text-[9px] px-1 rounded font-bold uppercase tracking-wider shrink-0 flex items-center gap-0.5"
+                        style={{ backgroundColor: `${elem.accent}33`, color: elem.accent }}
+                        title={elem.name}
+                      >
+                        {elem.icon}
+                      </span>
                     </div>
 
-                    <div className="flex-1 flex items-center justify-center my-0.5 overflow-hidden rounded bg-black/40">
+                    {/* Center Artwork */}
+                    <div className="relative flex-1 my-0.5 sm:my-1 overflow-hidden rounded-md bg-black/50 border border-white/10 flex items-center justify-center">
                       {monster.card.image ? (
-                        <img src={monster.card.image} alt={monster.card.name} className="w-full h-full object-cover" />
+                        <img
+                          src={monster.card.image}
+                          alt={monster.card.name}
+                          className="w-full h-full object-cover"
+                        />
                       ) : (
-                        <span className="text-xl">🐉</span>
+                        <span className="text-xl sm:text-2xl">{elem.icon}</span>
+                      )}
+
+                      {/* Stage indicator */}
+                      {monster.card.stage > 1 && (
+                        <div className="absolute top-0.5 left-0.5 px-1 rounded bg-amber-400 text-black text-[8px] font-black">
+                          E{monster.card.stage}
+                        </div>
                       )}
                     </div>
 
+                    {/* Bottom Status / Stats */}
                     {monster.summonTurnsLeft > 0 ? (
-                      <div className="text-[9px] text-amber-400 font-mono bg-black/80 rounded px-1 py-0.5 text-center font-bold">
-                        {monster.summonTurnsLeft}t carga
+                      <div className="text-[9px] sm:text-[10px] text-amber-300 font-mono bg-black/80 rounded px-1 py-0.5 text-center font-bold border border-amber-500/40">
+                        ⏳ {monster.summonTurnsLeft}t carga
                       </div>
                     ) : (
-                      <div className="flex items-center justify-between text-[10px] font-mono px-0.5 font-bold">
-                        <span className="text-rose-400">⚔️{monster.currentAttack}</span>
-                        <span className="text-cyan-400">🛡️{monster.currentDefense}</span>
+                      <div className="flex items-center justify-between text-[10px] sm:text-xs font-mono font-black bg-black/60 rounded px-1 py-0.5 border border-white/10">
+                        <span className="text-rose-400 drop-shadow">⚔️{monster.currentAttack}</span>
+                        <span className="text-cyan-400 drop-shadow">🛡️{monster.currentDefense}</span>
                       </div>
                     )}
+
+                    {/* Quick Detail Zoom Button */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInspectedCard(monster.card);
+                      }}
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-slate-900 border border-amber-400 text-amber-300 text-[10px] flex items-center justify-center shadow opacity-80 hover:opacity-100 hover:scale-110 active:scale-95 z-20 cursor-pointer"
+                      title="Segure para ampliar ou clique para detalhes"
+                    >
+                      🔍
+                    </button>
                   </div>
                 ) : (
-                  <div className="flex flex-col items-center justify-center text-cyan-700 text-center p-1">
+                  <div className="flex flex-col items-center justify-center text-cyan-600/70 text-center p-1">
                     <span className="text-[10px] font-mono">Invocar</span>
+                  </div>
+                )}
+
+                {/* Floating Combat Text for this slot */}
+                {floatingTexts
+                  .filter((f) => f.targetKey === slotKey)
+                  .map((f) => (
+                    <div
+                      key={f.id}
+                      className="absolute inset-0 pointer-events-none z-40 flex items-center justify-center animate-float-damage"
+                    >
+                      <span className={`text-base sm:text-xl font-black drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${f.color}`}>
+                        {f.text}
+                      </span>
+                    </div>
+                  ))}
+
+                {/* Slash Particle on Hit */}
+                {isHit && (
+                  <div className="absolute inset-0 pointer-events-none z-30 flex items-center justify-center">
+                    <span className="text-3xl sm:text-5xl animate-slash select-none">⚔️</span>
+                    <div className="absolute inset-0 bg-rose-500/35 rounded-xl animate-pulse" />
                   </div>
                 )}
               </div>
@@ -1306,50 +1723,158 @@ export const MonsterBattleArena: React.FC<MonsterBattleArenaProps> = ({
         {/* Player Stats & Header */}
         <div className="flex items-center justify-between border-t border-slate-800 pt-2">
           <div className="flex items-center gap-3">
-            {/* Player 1 Portrait */}
-            <div className="w-12 h-12 rounded-xl bg-cyan-950/80 border-2 border-cyan-500/50 flex items-center justify-center text-2xl shadow-lg">
-              {battle.player1.avatar || '🧙'}
+            {/* Player Portrait */}
+            <div className={`relative w-12 h-12 rounded-xl bg-cyan-950/80 border-2 border-cyan-500/50 flex items-center justify-center text-2xl shadow-lg transition-all ${
+              hitTargetKey === 'bottom-player' ? 'animate-shake ring-4 ring-rose-500 shadow-rose-500/60' : ''
+            }`}>
+              {bottomPlayer.avatar || '🧙'}
+              {hitTargetKey === 'bottom-player' && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <span className="text-3xl animate-slash select-none">💥</span>
+                </div>
+              )}
+              {floatingTexts
+                .filter((f) => f.targetKey === 'bottom-player')
+                .map((f) => (
+                  <div key={f.id} className="absolute -top-3 left-1/2 -translate-x-1/2 pointer-events-none z-40 animate-float-damage whitespace-nowrap">
+                    <span className={`text-sm sm:text-base font-black drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${f.color}`}>
+                      {f.text}
+                    </span>
+                  </div>
+                ))}
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-white tracking-wide text-sm sm:text-base">
-                  {battle.player1.name}
+                  {bottomPlayer.name}
                 </span>
-                {battle.currentTurn === 'player1' && (
+                {battle.currentTurn === bottomPlayerKey && (
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-600/40 text-cyan-300 border border-cyan-500/30">
                     SUA VEZ
                   </span>
                 )}
               </div>
-              {renderHealthBar(battle.player1.hp, battle.player1.maxHp)}
+              {renderHealthBar(bottomPlayer.hp, bottomPlayer.maxHp)}
             </div>
           </div>
 
           <div className="flex items-center gap-4 text-xs text-slate-400 font-mono">
             <div>
               <span className="text-slate-500">Cartas no Deck: </span>
-              <span className="text-white font-bold">{battle.player1.deck.length}</span>
+              <span className="text-white font-bold">{bottomPlayer.deck.length}</span>
             </div>
           </div>
         </div>
 
-        {/* Player 1 Hand Tray */}
-        <div className="mt-1 flex items-center justify-center gap-2 sm:gap-3 overflow-x-auto py-1 px-2 scrollbar-none">
-          {battle.player1.hand.map((card, idx) => (
-            <CardComponent
+        {/* Player Hand Tray */}
+        <div className="mt-1 flex items-center justify-center gap-2 sm:gap-3 overflow-x-auto py-2 px-2 scrollbar-none">
+          {bottomPlayer.hand.map((card, idx) => (
+            <div
               key={`${card.id}_${idx}`}
-              card={card}
-              size="sm"
-              isSelected={battle.selectedCardIndex === idx}
-              isPlayable={battle.currentTurn === 'player1'}
-              onClick={() => handleHandCardClick(idx)}
-            />
+              className="relative group transition-transform duration-200 hover:scale-105 hover:-translate-y-2 z-10 hover:z-30 cursor-pointer select-none"
+              onMouseEnter={() => setHoveredCard(card)}
+              onMouseLeave={() => setHoveredCard(null)}
+              onTouchStart={() => startLongPress(card)}
+              onTouchEnd={cancelLongPress}
+              onTouchMove={cancelLongPress}
+              onTouchCancel={cancelLongPress}
+              onClick={() => {
+                if (isLongPressActiveRef.current) {
+                  isLongPressActiveRef.current = false;
+                  return;
+                }
+                handleHandCardClick(idx);
+              }}
+            >
+              <CardComponent
+                card={card}
+                size="sm"
+                isSelected={battle.selectedCardIndex === idx}
+                isPlayable={battle.currentTurn === bottomPlayerKey}
+              />
+
+              {/* Quick Details Button for easy accessibility without long-press */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setInspectedCard(card);
+                }}
+                className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-slate-900 border border-amber-400 text-amber-300 text-[10px] font-bold flex items-center justify-center shadow opacity-80 hover:opacity-100 hover:scale-110 active:scale-90 transition z-20 cursor-pointer"
+                title="Toque e segure para ampliar, ou clique aqui para ver detalhes"
+              >
+                🔍
+              </button>
+            </div>
           ))}
-          {battle.player1.hand.length === 0 && (
+          {bottomPlayer.hand.length === 0 && (
             <div className="text-xs text-slate-500 py-4">Mão vazia. Espere o próximo turno para sacar!</div>
           )}
         </div>
       </div>
+
+      {/* Desktop Non-blocking Hover Preview (pinned, never captures clicks) */}
+      {hoveredCard && !inspectedCard && (
+        <div className="fixed bottom-24 right-4 sm:right-10 z-30 pointer-events-none drop-shadow-2xl animate-in fade-in zoom-in-95 duration-150 hidden md:block">
+          <div className="p-2 bg-slate-950/95 border-2 border-amber-400/80 rounded-2xl shadow-2xl shadow-amber-500/30 backdrop-blur-md flex flex-col items-center">
+            <span className="text-[10px] font-bold text-amber-300 uppercase tracking-widest mb-1">
+              Prévia da Carta
+            </span>
+            <CardComponent card={hoveredCard} size="lg" />
+          </div>
+        </div>
+      )}
+
+      {/* Enlarged Card Inspector / Zoom Modal (Shown when holding pressed on mobile or clicking 🔍) */}
+      {inspectedCard && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150"
+          onClick={() => setInspectedCard(null)}
+        >
+          <div
+            className="relative p-4 bg-slate-950/95 border-2 border-amber-400 rounded-3xl shadow-2xl shadow-amber-500/40 flex flex-col items-center max-w-sm w-full animate-in zoom-in-95 duration-200"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="w-full flex items-center justify-between mb-2">
+              <span className="text-xs font-black text-amber-300 uppercase tracking-widest flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                <span>Detalhes da Carta</span>
+              </span>
+              <button
+                onClick={() => setInspectedCard(null)}
+                className="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center font-bold text-xs transition cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <CardComponent card={inspectedCard} size="xl" />
+
+            <div className="w-full mt-3 flex items-center gap-2">
+              {bottomPlayer.hand.some((c) => c.id === inspectedCard.id) && battle.currentTurn === bottomPlayerKey && (
+                <button
+                  onClick={() => {
+                    const idx = bottomPlayer.hand.findIndex((c) => c.id === inspectedCard.id);
+                    if (idx !== -1) {
+                      handleHandCardClick(idx);
+                    }
+                    setInspectedCard(null);
+                  }}
+                  className="flex-1 py-2 px-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-xs shadow-md transition cursor-pointer"
+                >
+                  ⚡ Ativar / Jogar Carta
+                </button>
+              )}
+              <button
+                onClick={() => setInspectedCard(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-600 transition cursor-pointer"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ========================================================================= */}
       {/* GAME OVER MODAL */}
